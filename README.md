@@ -16,6 +16,20 @@ MonitorDDC 是一款 Windows 显示器调节工具，通过 DDC/CI 控制外接�
 
 ## 命令行
 
+这些命令可以在 Windows 命令提示符（CMD）或 PowerShell 中使用。
+
+CMD：
+
+```cmd
+cd /d D:\tianwen_project\GitHub_project\MonitorDDC\target\release
+MonitorDDC.exe --list
+MonitorDDC.exe --get-brightness
+MonitorDDC.exe --monitor 0 --brightness 30
+MonitorDDC.exe --help
+```
+
+PowerShell：
+
 ```powershell
 # 显示器列表及当前参数
 .\MonitorDDC.exe --list
@@ -30,7 +44,7 @@ MonitorDDC 是一款 Windows 显示器调节工具，通过 DDC/CI 控制外接�
 .\MonitorDDC.exe --monitor 0 --brightness 30
 ```
 
-亮度和对比度取值范围为 `0` 到 `100`。不带参数运行时打开图形界面。
+CMD 中直接输入 `MonitorDDC.exe`，PowerShell 中使用 `.\MonitorDDC.exe`。亮度和对比度取值范围为 `0` 到 `100`。不带参数运行或双击 exe 时打开图形界面。
 
 ## 编译
 
@@ -53,6 +67,8 @@ target\release\MonitorDDC.exe
 ```
 
 程序使用静态 MSVC CRT，发布时只需要这个 exe。程序 Logo 已保存在 `assets/` 并由 `build.rs` 自动嵌入。
+
+Python 不是程序运行或正常编译所需的依赖。`tools\make_icon.py` 只是以后更换 Logo 时使用的可选工具。
 
 ## GitHub
 
