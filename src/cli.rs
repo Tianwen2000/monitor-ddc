@@ -39,6 +39,10 @@ pub struct Args {
     /// 明确启动图形界面。
     #[arg(long, action = ArgAction::SetTrue)]
     pub gui: bool,
+
+    /// 启动后直接驻留系统托盘（用于开机自动启动）。
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with_all = ["gui", "brightness", "contrast", "get_brightness", "get_contrast", "list", "monitor"])]
+    pub tray: bool,
 }
 
 impl Args {

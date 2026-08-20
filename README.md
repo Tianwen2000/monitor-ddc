@@ -6,6 +6,13 @@ MonitorDDC 是一款 Windows 显示器调节工具，通过 DDC/CI 控制外接�
 
 从 GitHub Releases 下载 `MonitorDDC.exe` 后直接双击运行，无需安装其他运行库。
 
+程序运行时会驻留在 Windows 系统托盘：
+
+- 单击托盘图标可显示或隐藏主窗口
+- 点击窗口关闭按钮只会隐藏到托盘，不会退出程序
+- 右键托盘图标可选择“打开窗口”“重新扫描显示器”或“退出”
+- 勾选“开机自动启动”后，登录 Windows 时会静默启动并直接驻留托盘
+
 使用前请确认：
 
 - 系统为 64 位 Windows 10 或 Windows 11
@@ -45,6 +52,8 @@ PowerShell：
 ```
 
 CMD 中直接输入 `MonitorDDC.exe`，PowerShell 中使用 `.\MonitorDDC.exe`。亮度和对比度取值范围为 `0` 到 `100`。不带参数运行或双击 exe 时打开图形界面。
+
+`MonitorDDC.exe --tray` 会隐藏主窗口并直接驻留托盘，主要供开机自动启动使用。
 
 ## 编译
 

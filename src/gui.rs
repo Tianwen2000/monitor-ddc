@@ -1,37 +1,198 @@
 //! egui application state and graphical interface.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use tray_icon::{
+    MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+};
 
 use crate::ddc::{self, Feature, Monitor};
+use crate::startup;
 
 const WRITE_INTERVAL: Duration = Duration::from_millis(40);
+const TRAY_TOGGLE_INTERVAL: Duration = Duration::from_millis(250);
 const FALLBACK_MAXIMUM: u32 = 100;
 const FALLBACK_VALUE: u8 = 50;
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(31, 120, 180);
 
-pub fn run() -> eframe::Result {
+pub fn run(start_hidden: bool) -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/MonitorDDC.png"))
         .expect("embedded application icon must be a valid PNG");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("MonitorDDC 显示器调节")
-            .with_icon(icon)
+            .with_icon(icon.clone())
             .with_inner_size([760.0, 590.0])
-            .with_min_inner_size([620.0, 430.0]),
+            .with_min_inner_size([620.0, 430.0])
+            .with_visible(!start_hidden),
         ..Default::default()
     };
 
     eframe::run_native(
         "MonitorDDC 显示器调节",
         options,
-        Box::new(|context| {
+        Box::new(move |context| {
             configure_style(&context.egui_ctx);
-            Ok(Box::new(DdcApp::new()))
+            let (tray_icon, tray_actions) = create_tray(&context.egui_ctx, &icon)
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+            let startup_hiding = Arc::new(AtomicBool::new(start_hidden));
+            let app = DdcApp::new(
+                tray_icon,
+                tray_actions,
+                start_hidden,
+                Arc::clone(&startup_hiding),
+            );
+            if start_hidden {
+                thread::spawn(move || {
+                    hide_main_window_after_start(&startup_hiding);
+                });
+            }
+            Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(target_os = "windows")]
+fn hide_main_window_after_start(active: &AtomicBool) {
+    for _ in 0..30 {
+        if !active.load(Ordering::SeqCst) {
+            return;
+        }
+        if hide_main_window_now() {
+            active.store(false, Ordering::SeqCst);
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    active.store(false, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "windows")]
+fn hide_main_window_now() -> bool {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SW_HIDE, ShowWindow,
+    };
+    use windows::core::BOOL;
+
+    struct HideState {
+        process_id: u32,
+        hidden: bool,
+    }
+
+    unsafe extern "system" fn hide_process_window(window: HWND, parameter: LPARAM) -> BOOL {
+        let state = unsafe { &mut *(parameter.0 as *mut HideState) };
+        let mut process_id = 0_u32;
+        unsafe {
+            GetWindowThreadProcessId(window, Some(&mut process_id));
+        }
+        if process_id == state.process_id && unsafe { IsWindowVisible(window).as_bool() } {
+            unsafe {
+                let _ = ShowWindow(window, SW_HIDE);
+            }
+            state.hidden = true;
+        }
+        true.into()
+    }
+
+    let mut state = HideState {
+        process_id: std::process::id(),
+        hidden: false,
+    };
+    let _ = unsafe {
+        EnumWindows(
+            Some(hide_process_window),
+            LPARAM(std::ptr::from_mut(&mut state) as isize),
+        )
+    };
+    state.hidden
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_main_window_after_start(_active: &AtomicBool) {}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_main_window_now() -> bool {
+    false
+}
+
+#[derive(Clone, Copy)]
+enum TrayAction {
+    ToggleWindow,
+    OpenWindow,
+    Rescan,
+    Exit,
+}
+
+fn create_tray(
+    context: &egui::Context,
+    icon: &egui::IconData,
+) -> Result<(TrayIcon, mpsc::Receiver<TrayAction>), String> {
+    let open_item = MenuItem::new("打开窗口", true, None);
+    let rescan_item = MenuItem::new("重新扫描显示器", true, None);
+    let exit_item = MenuItem::new("退出", true, None);
+    let separator = PredefinedMenuItem::separator();
+    let menu = Menu::with_items(&[&open_item, &rescan_item, &separator, &exit_item])
+        .map_err(|error| format!("创建托盘菜单失败：{error}"))?;
+
+    let open_id = open_item.id().clone();
+    let rescan_id = rescan_item.id().clone();
+    let exit_id = exit_item.id().clone();
+    let (sender, receiver) = mpsc::channel();
+
+    let tray_sender = sender.clone();
+    let tray_context = context.clone();
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        if matches!(
+            event,
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+        ) {
+            let _ = tray_sender.send(TrayAction::ToggleWindow);
+            tray_context.request_repaint();
+        }
+    }));
+
+    let menu_context = context.clone();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        let action = if event.id == open_id {
+            Some(TrayAction::OpenWindow)
+        } else if event.id == rescan_id {
+            Some(TrayAction::Rescan)
+        } else if event.id == exit_id {
+            Some(TrayAction::Exit)
+        } else {
+            None
+        };
+        if let Some(action) = action {
+            let _ = sender.send(action);
+            menu_context.request_repaint();
+        }
+    }));
+
+    let tray_image = tray_icon::Icon::from_rgba(icon.rgba.clone(), icon.width, icon.height)
+        .map_err(|error| format!("加载托盘图标失败：{error}"))?;
+    let tray_icon = TrayIconBuilder::new()
+        .with_tooltip("MonitorDDC 显示器调节")
+        .with_icon(tray_image)
+        .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
+        .with_menu_on_right_click(true)
+        .build()
+        .map_err(|error| format!("创建系统托盘图标失败：{error}"))?;
+
+    Ok((tray_icon, receiver))
 }
 
 fn configure_style(context: &egui::Context) {
@@ -82,6 +243,14 @@ struct DdcApp {
     monitors: Vec<MonitorState>,
     selected: Option<usize>,
     status: String,
+    startup_enabled: bool,
+    _tray_icon: TrayIcon,
+    tray_actions: mpsc::Receiver<TrayAction>,
+    window_visible: bool,
+    allow_exit: bool,
+    last_tray_toggle: Instant,
+    startup_hide_frames: u8,
+    startup_hiding: Arc<AtomicBool>,
 }
 
 struct MonitorState {
@@ -100,17 +269,90 @@ struct FeatureState {
 }
 
 impl DdcApp {
-    fn new() -> Self {
+    fn new(
+        tray_icon: TrayIcon,
+        tray_actions: mpsc::Receiver<TrayAction>,
+        start_hidden: bool,
+        startup_hiding: Arc<AtomicBool>,
+    ) -> Self {
+        let (startup_enabled, startup_error) = match startup::is_enabled() {
+            Ok(enabled) => (enabled, None),
+            Err(error) => (false, Some(error)),
+        };
         let mut app = Self {
             monitors: Vec::new(),
             selected: None,
             status: String::new(),
+            startup_enabled,
+            _tray_icon: tray_icon,
+            tray_actions,
+            window_visible: !start_hidden,
+            allow_exit: false,
+            last_tray_toggle: Instant::now() - TRAY_TOGGLE_INTERVAL,
+            // eframe reveals the native window after its first painted frame;
+            // hide it again on the next frame when launched with --tray.
+            startup_hide_frames: if start_hidden { 2 } else { 0 },
+            startup_hiding,
         };
         app.rescan();
+        if let Some(error) = startup_error {
+            app.status = format!("无法读取开机启动设置：{error}");
+        }
         app
     }
 
+    fn process_tray_actions(&mut self, context: &egui::Context) {
+        while let Ok(action) = self.tray_actions.try_recv() {
+            match action {
+                TrayAction::ToggleWindow => {
+                    if self.last_tray_toggle.elapsed() >= TRAY_TOGGLE_INTERVAL {
+                        self.set_window_visible(context, !self.window_visible);
+                        self.last_tray_toggle = Instant::now();
+                    }
+                }
+                TrayAction::OpenWindow => self.set_window_visible(context, true),
+                TrayAction::Rescan => self.rescan(),
+                TrayAction::Exit => {
+                    self.allow_exit = true;
+                    context.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn set_window_visible(&mut self, context: &egui::Context, visible: bool) {
+        if visible {
+            self.startup_hiding.store(false, Ordering::SeqCst);
+            self.startup_hide_frames = 0;
+        }
+        context.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+        if visible {
+            context.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            context.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        self.window_visible = visible;
+    }
+
+    fn update_startup_setting(&mut self, enabled: bool) {
+        match startup::set_enabled(enabled) {
+            Ok(()) => {
+                self.startup_enabled = enabled;
+                self.status = if enabled {
+                    "已启用开机自动启动，登录后将静默驻留系统托盘".to_owned()
+                } else {
+                    "已关闭开机自动启动".to_owned()
+                };
+            }
+            Err(error) => self.status = format!("修改开机启动设置失败：{error}"),
+        }
+    }
+
     fn rescan(&mut self) {
+        let previous_key = self
+            .selected
+            .and_then(|selected| self.monitors.get(selected))
+            .map(MonitorState::stable_key);
+
         // Replacing the vector drops all old physical handles before a fresh scan.
         self.monitors.clear();
         self.selected = None;
@@ -118,7 +360,14 @@ impl DdcApp {
         match ddc::enumerate_monitors() {
             Ok(monitors) => {
                 self.monitors = monitors.into_iter().map(MonitorState::load).collect();
-                self.selected = (!self.monitors.is_empty()).then_some(0);
+                self.selected = previous_key
+                    .as_ref()
+                    .and_then(|key| {
+                        self.monitors
+                            .iter()
+                            .position(|monitor| monitor.stable_key() == *key)
+                    })
+                    .or_else(|| (!self.monitors.is_empty()).then_some(0));
                 let usable = self
                     .monitors
                     .iter()
@@ -184,6 +433,32 @@ impl MonitorState {
         };
         format!("{brightness}，{contrast}")
     }
+
+    fn stable_key(&self) -> String {
+        if let Some(path) = &self.monitor.info.device_path {
+            return format!("path:{path}");
+        }
+
+        format!(
+            "edid:{}:{}:{}:{}",
+            self.monitor
+                .info
+                .manufacturer_code
+                .as_deref()
+                .unwrap_or_default(),
+            self.monitor
+                .info
+                .product_code
+                .map(|code| code.to_string())
+                .unwrap_or_default(),
+            self.monitor
+                .info
+                .friendly_name
+                .as_deref()
+                .unwrap_or_default(),
+            self.monitor.description
+        )
+    }
 }
 
 fn load_feature(monitor: &Monitor, feature: Feature) -> FeatureState {
@@ -247,6 +522,19 @@ fn flush_feature(
 
 impl eframe::App for DdcApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.process_tray_actions(context);
+        if self.startup_hide_frames > 0 {
+            hide_main_window_now();
+            context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.startup_hide_frames -= 1;
+            context.request_repaint_after(Duration::from_millis(20));
+        }
+        if context.input(|input| input.viewport().close_requested()) && !self.allow_exit {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.set_window_visible(context, false);
+            self.status = "窗口已隐藏到系统托盘".to_owned();
+        }
+
         self.update_pending_writes();
         if self.monitors.iter().any(|monitor| {
             monitor.brightness.pending.is_some() || monitor.contrast.pending.is_some()
@@ -264,6 +552,14 @@ impl eframe::App for DdcApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⟳  重新扫描").clicked() {
                         self.rescan();
+                    }
+                    let mut startup_enabled = self.startup_enabled;
+                    if ui
+                        .checkbox(&mut startup_enabled, "开机自动启动")
+                        .on_hover_text("登录 Windows 后静默启动并驻留系统托盘")
+                        .changed()
+                    {
+                        self.update_startup_setting(startup_enabled);
                     }
                 });
             });

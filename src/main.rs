@@ -8,6 +8,7 @@ mod cli;
 mod ddc;
 mod display_info;
 mod gui;
+mod startup;
 
 use clap::Parser;
 
@@ -19,7 +20,7 @@ fn main() {
             eprintln!("错误：{error}");
             std::process::exit(1);
         }
-    } else if let Err(error) = gui::run() {
+    } else if let Err(error) = gui::run(args.tray) {
         eprintln!("无法启动图形界面：{error}");
         std::process::exit(1);
     }
